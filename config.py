@@ -34,12 +34,22 @@ STRENGTH_EXERCISES = {
 # min_value / max_value -> guard rails so targets can't run away
 # depends_on         -> (optional) another metric that must be "maxed" first
 CONDITIONING_METRICS = {
-    "Jump rope 10 min":    dict(start=1250, easy=25,   moderate=10, hard=-10, unit="jumps",     higher_is_better=True,  min_value=0),
+    "Jump rope (per round)":        dict(start=250, easy=10, moderate=0, hard=-10, unit="jumps",  higher_is_better=True, min_value=0),
+    "Burpees (per round)":          dict(start=10,  easy=1,  moderate=0, hard=-1,  unit="reps",   higher_is_better=True, min_value=0),
+    "Mountain climbers (per round)": dict(start=40, easy=2,  moderate=0, hard=-2,  unit="reps",   higher_is_better=True, min_value=0),
+    "Push-ups (per round)":         dict(start=9,   easy=3,  moderate=0, hard=-3,  unit="reps",   higher_is_better=True, min_value=3),
+    # 9 = three cycles of (1 regular, 1 wide-right, 1 wide-left); progresses a
+    # full cycle (3) at a time so the rotation pattern never gets split.
     "Row intervals":       dict(start=120,  easy=-0.5, moderate=0,  hard=1,   unit="sec/500m",  higher_is_better=False, min_value=60),
     "Hill sprint reps":    dict(start=6,    easy=1,    moderate=0,  hard=-1,  unit="reps",      higher_is_better=True,  min_value=4, max_value=10),
     "Hill sprint duration": dict(start=10,  easy=1,    moderate=0,  hard=0,   unit="seconds",   higher_is_better=True,  min_value=10,
                                   depends_on=("Hill sprint reps", 10)),  # only climbs once hill sprint reps has hit 10
 }
+
+# Jump circuit is 4 rounds of all four movements above, back to back. Rounds
+# is fixed by design (Levi's call) — the four movements progress
+# independently instead.
+JUMP_CIRCUIT_ROUNDS = 4
 
 # ---------------------------------------------------------------------------
 # Weekly plan — how many sessions of each type you're aiming for per week
@@ -58,7 +68,8 @@ WEEKLY_PLAN_TARGETS = {
 # hill sprints, two related) metrics.
 WORKOUT_CATEGORIES = {
     "Strength":     dict(kind="strength",     items=list(STRENGTH_EXERCISES.keys())),
-    "Jump circuit": dict(kind="conditioning", items=["Jump rope 10 min"]),
+    "Jump circuit": dict(kind="conditioning", items=["Jump rope (per round)", "Burpees (per round)",
+                                                       "Mountain climbers (per round)", "Push-ups (per round)"]),
     "Rowing":       dict(kind="conditioning", items=["Row intervals"]),
     "Hill sprints": dict(kind="conditioning", items=["Hill sprint reps", "Hill sprint duration"]),
     "Mobility":     dict(kind="mobility",     items=[]),
@@ -82,3 +93,8 @@ WEEK_START_WEEKDAY = 0
 
 # Local dev database. Overridden by DATABASE_URL env var when deployed to Neon.
 DEFAULT_DB_PATH = "tracker.db"
+
+# The app's server clock (Streamlit Cloud, UTC) isn't your clock. This makes
+# "today" and week boundaries match your actual local day, not the server's —
+# matters most for late-night/early-morning sessions near a day or week edge.
+TIMEZONE = "America/Denver"

@@ -13,7 +13,8 @@ in app.py, needs to change.
 
 import os
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from config import (
     STRENGTH_EXERCISES,
@@ -22,6 +23,7 @@ from config import (
     WORKOUT_CATEGORIES,
     SCORE_WEIGHTS,
     DEFAULT_DB_PATH,
+    TIMEZONE,
 )
 
 # ---------------------------------------------------------------------------
@@ -99,6 +101,7 @@ _SQLITE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS conditioning_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT NOT NULL,
+        session TEXT,
         workout_type TEXT NOT NULL,
         metric TEXT,
         value REAL,
@@ -139,6 +142,7 @@ _POSTGRES_SCHEMA = """
     CREATE TABLE IF NOT EXISTS conditioning_log (
         id SERIAL PRIMARY KEY,
         date TEXT NOT NULL,
+        session TEXT,
         workout_type TEXT NOT NULL,
         metric TEXT,
         value REAL,
@@ -175,6 +179,22 @@ def week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())  # Monday=0
 
 
+def local_today() -> date:
+    """'Today' in your actual timezone, not the server's."""
+    return datetime.now(ZoneInfo(TIMEZONE)).date()
+
+
+# Derived once from config, not hand-maintained, so it can't drift out of sync
+# if WORKOUT_CATEGORIES ever changes.
+_metric_category = {
+    m: cat for cat, info in WORKOUT_CATEGORIES.items()
+    if info["kind"] == "conditioning" for m in info["items"]
+}
+_conditioning_categories = tuple(
+    cat for cat, info in WORKOUT_CATEGORIES.items() if info["kind"] == "conditioning"
+)
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -196,12 +216,16 @@ def log_strength(conn, entry_date: date, session: str, exercise: str, load: floa
 
 
 def log_conditioning(conn, entry_date: date, workout_type: str, metric: str, value: float,
-                      rpe: int, completed: bool, notes: str = ""):
+                      rpe: int, completed: bool, notes: str = "", session: str = None):
+    # Default groups same-day, same-category entries as one session — matters
+    # for circuits like Jump circuit or Hill sprints, which log several
+    # movements per visit and should count as ONE session, not one per movement.
+    session = session or f"{workout_type}-{entry_date.isoformat()}"
     conn.execute(
         """INSERT INTO conditioning_log
-           (date, workout_type, metric, value, completed, rpe, notes, week)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (entry_date.isoformat(), workout_type, metric, value,
+           (date, session, workout_type, metric, value, completed, rpe, notes, week)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (entry_date.isoformat(), session, workout_type, metric, value,
          int(completed), rpe, notes, week_start(entry_date).isoformat()),
     )
     conn.commit()
@@ -266,8 +290,9 @@ def get_last_conditioning_entry(conn, metric: str):
 # ---------------------------------------------------------------------------
 
 def _distribute_reps(total: int, sets: int, exercise: str) -> str:
-    if exercise == "Dead hang":
-        return f"{total} sec"
+    unit = STRENGTH_EXERCISES[exercise]["unit"]
+    if sets == 1:
+        return f"{total} {unit}"
     base, remainder = divmod(total, sets)
     parts = [base + 1 if i < remainder else base for i in range(sets)]
     return " / ".join(str(p) for p in parts)
@@ -328,8 +353,8 @@ def get_next_conditioning_target(conn, metric: str, last: dict = None) -> dict:
     # Hill sprint duration only advances once Hill sprint reps has hit its cap
     if "depends_on" in cfg:
         gate_metric, gate_value = cfg["depends_on"]
-        gate_last = get_last_conditioning_entry(conn, gate_metric)
-        gated_open = bool(gate_last and gate_last["value"] is not None and gate_last["value"] >= gate_value)
+        gate_pr = get_conditioning_pr(conn, gate_metric)
+        gated_open = gate_pr is not None and gate_pr >= gate_value
         if not gated_open:
             return dict(next_target=value, message="Keep duration")
         if completed and rpe is not None and rpe <= 7:
@@ -367,7 +392,7 @@ def get_weekly_summary(conn, num_weeks: int = 12) -> list:
     up to and including the current week. Indices are self-normalizing against
     the best value seen up to and including that week (a personal-best = 100).
     """
-    this_week = week_start(date.today())
+    this_week = week_start(local_today())
     weeks = [this_week - timedelta(weeks=i) for i in range(num_weeks - 1, -1, -1)]
 
     running_strength_pr = 0.0
@@ -383,11 +408,11 @@ def get_weekly_summary(conn, num_weeks: int = 12) -> list:
         ).fetchone()["n"]
 
         cond_rows = conn.execute(
-            "SELECT workout_type, metric, value FROM conditioning_log WHERE week = ?", (wk_str,)
+            "SELECT session, workout_type, metric, value FROM conditioning_log WHERE week = ?", (wk_str,)
         ).fetchall()
-        mobility_sessions = sum(1 for r in cond_rows if r["workout_type"] == "Mobility")
-        plan_sessions = {wt: sum(1 for r in cond_rows if r["workout_type"] == wt)
-                          for wt in ("Jump circuit", "Rowing", "Hill sprints")}
+        mobility_sessions = len({r["session"] for r in cond_rows if r["workout_type"] == "Mobility"})
+        plan_sessions = {wt: len({r["session"] for r in cond_rows if r["workout_type"] == wt})
+                          for wt in _conditioning_categories}
         conditioning_sessions = sum(plan_sessions.values())
 
         strength_volume = conn.execute(
@@ -397,8 +422,11 @@ def get_weekly_summary(conn, num_weeks: int = 12) -> list:
         running_strength_pr = max(running_strength_pr, strength_volume)
         strength_index = (100 * strength_volume / running_strength_pr) if strength_volume > 0 else None
 
-        # Conditioning: best value per metric this week, normalized against PR-to-date
-        metric_scores = []
+        # Conditioning: best value per metric this week, normalized against PR-to-date.
+        # Grouped by category first, THEN averaged across categories — otherwise a
+        # 4-movement circuit like Jump circuit would outweigh a 1-metric category
+        # like Rowing just by having more movements, not by being more important.
+        category_scores = {}
         for metric, cfg in CONDITIONING_METRICS.items():
             vals = [r["value"] for r in cond_rows if r["metric"] == metric and r["value"] is not None]
             if not vals:
@@ -413,8 +441,9 @@ def get_weekly_summary(conn, num_weeks: int = 12) -> list:
             if pr == 0:
                 continue
             score = (100 * best_this_week / pr) if cfg["higher_is_better"] else (100 * pr / best_this_week)
-            metric_scores.append(score)
-        conditioning_index = (sum(metric_scores) / len(metric_scores)) if metric_scores else None
+            category_scores.setdefault(_metric_category[metric], []).append(score)
+        per_category_avgs = [sum(scores) / len(scores) for scores in category_scores.values()]
+        conditioning_index = (sum(per_category_avgs) / len(per_category_avgs)) if per_category_avgs else None
 
         bc_row = conn.execute(
             "SELECT lean_mass FROM body_comp_log WHERE week = ? ORDER BY date DESC LIMIT 1", (wk_str,)
@@ -474,7 +503,7 @@ def get_weekly_summary(conn, num_weeks: int = 12) -> list:
 
 def get_week_category_counts(conn, wk: date = None) -> dict:
     """Sessions logged so far this week, broken down by weekly-plan category."""
-    wk = wk or week_start(date.today())
+    wk = wk or week_start(local_today())
     wk_str = wk.isoformat()
     counts = {
         "Strength": conn.execute(
@@ -483,7 +512,7 @@ def get_week_category_counts(conn, wk: date = None) -> dict:
     }
     for cat in ("Jump circuit", "Rowing", "Hill sprints", "Mobility"):
         counts[cat] = conn.execute(
-            "SELECT COUNT(*) AS n FROM conditioning_log WHERE week = ? AND workout_type = ?",
+            "SELECT COUNT(DISTINCT session) AS n FROM conditioning_log WHERE week = ? AND workout_type = ?",
             (wk_str, cat),
         ).fetchone()["n"]
     return counts
@@ -515,9 +544,14 @@ def get_todays_suggestion(conn) -> dict:
                     remaining_this_week=remaining[best_cat])
 
     if cat_info["kind"] == "conditioning":
-        metric = cat_info["items"][0]  # hill sprints leads with reps; duration follows once reps are maxed
-        target = get_next_conditioning_target(conn, metric, get_last_conditioning_entry(conn, metric))
-        return dict(category=best_cat, kind="conditioning", metric=metric, target=target,
+        # All movements in this category are done together in one session
+        # (e.g. Jump circuit = jump rope + burpees + mountain climbers +
+        # push-ups, back to back) — so every movement gets its own target.
+        items = []
+        for metric in cat_info["items"]:
+            target = get_next_conditioning_target(conn, metric, get_last_conditioning_entry(conn, metric))
+            items.append(dict(metric=metric, target=target))
+        return dict(category=best_cat, kind="conditioning", items=items,
                     remaining_this_week=remaining[best_cat])
 
     return dict(category=best_cat, kind="mobility", remaining_this_week=remaining[best_cat])

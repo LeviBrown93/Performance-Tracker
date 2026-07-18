@@ -6,7 +6,6 @@ with one tap, confirms PRs on the spot, and rolls everything into a
 Dashboard with score cards and trend charts.
 """
 
-from datetime import date
 import os
 
 import pandas as pd
@@ -49,8 +48,11 @@ st.markdown(
 )
 
 
-@st.cache_resource
 def get_conn():
+    # Not cached on purpose: a single shared connection isn't safe to use from
+    # two browser sessions at once (e.g. phone logging while the dashboard is
+    # open on your computer), and opening a fresh one per run is cheap enough
+    # at this usage scale to not be worth the risk.
     conn = logic.get_connection()
     logic.init_db(conn)
     return conn
@@ -85,13 +87,13 @@ def render_suggestion_card(suggestion):
             f"_{target['message']}_ · {due_note}"
         )
     elif suggestion["kind"] == "conditioning":
-        metric = suggestion["metric"]
-        target = suggestion["target"]
-        unit = CONDITIONING_METRICS[metric]["unit"]
+        lines = []
+        for entry in suggestion["items"]:
+            metric, target = entry["metric"], entry["target"]
+            unit = CONDITIONING_METRICS[metric]["unit"]
+            lines.append(f"- **{metric}**: {target['next_target']:g} {unit} — _{target['message']}_")
         st.info(
-            f"**Today's suggestion — {suggestion['category']}: {metric}**\n\n"
-            f"Target: **{target['next_target']:g} {unit}**\n\n"
-            f"_{target['message']}_ · {due_note}"
+            f"**Today's suggestion — {suggestion['category']}**\n\n" + "\n".join(lines) + f"\n\n{due_note}"
         )
     else:
         st.info(f"**Today's suggestion — {suggestion['category']}**\n\nAny mobility session counts · {due_note}")
@@ -106,7 +108,7 @@ with tab_log:
     if "active_category" not in st.session_state:
         st.session_state.active_category = suggestion["category"]
         st.session_state.active_kind = suggestion["kind"]
-        st.session_state.active_item = suggestion.get("exercise") or suggestion.get("metric")
+        st.session_state.active_item = suggestion.get("exercise")  # only used for strength
 
     render_suggestion_card(suggestion)
 
@@ -119,8 +121,7 @@ with tab_log:
         item_choice = None
         if cat_info["kind"] == "strength":
             item_choice = st.selectbox("Exercise", cat_info["items"])
-        elif cat_info["kind"] == "conditioning":
-            item_choice = st.selectbox("Metric", cat_info["items"])
+        # Conditioning categories log every movement together — no per-item picker needed.
 
         if st.button("Switch to this", use_container_width=True):
             st.session_state.active_category = cat_choice
@@ -132,6 +133,7 @@ with tab_log:
 
     kind = st.session_state.active_kind
     item = st.session_state.active_item
+    category = st.session_state.active_category
 
     # --- Strength logging form -------------------------------------------
     if kind == "strength":
@@ -157,7 +159,7 @@ with tab_log:
 
         if submitted:
             prev_pr = logic.get_strength_pr(conn, item)
-            logic.log_strength(conn, date.today(), f"session-{date.today().isoformat()}", item,
+            logic.log_strength(conn, logic.local_today(), f"session-{logic.local_today().isoformat()}", item,
                                 load=load, sets=sets, rpe=rpe, completed=(completed == "Yes"), notes=notes)
             new_workload = sum(sets) * (1 + load / 100.0)
             is_pr = prev_pr is None or new_workload >= prev_pr
@@ -171,32 +173,43 @@ with tab_log:
 
     # --- Conditioning logging form -----------------------------------------
     elif kind == "conditioning":
-        cfg = CONDITIONING_METRICS[item]
-        last = logic.get_last_conditioning_entry(conn, item)
-        target = logic.get_next_conditioning_target(conn, item, last)
-        category = st.session_state.active_category
-        st.markdown(f"### Log: {item}")
-        st.caption(f"Aiming for {target['next_target']:g} {cfg['unit']}")
+        cat_info = WORKOUT_CATEGORIES[category]
+        metrics = cat_info["items"]
+        targets = {m: logic.get_next_conditioning_target(conn, m, logic.get_last_conditioning_entry(conn, m))
+                   for m in metrics}
+        prev_prs = {m: logic.get_conditioning_pr(conn, m) for m in metrics}
 
-        with st.form(f"conditioning_form_{item}", clear_on_submit=True):
-            value = st.number_input(f"Result ({cfg['unit']})", min_value=0.0,
-                                     value=float(target["next_target"]), step=1.0)
-            completed = st.segmented_control("Completed target?", ["Yes", "No"], default="Yes", key=f"c_completed_{item}")
-            rpe = st.pills("RPE", list(range(1, 11)), default=7, key=f"c_rpe_{item}")
-            notes = st.text_input("Notes (optional)", key=f"c_notes_{item}")
+        st.markdown(f"### Log: {category}")
+        st.caption(" · ".join(f"{m}: {targets[m]['next_target']:g} {CONDITIONING_METRICS[m]['unit']}" for m in metrics))
+
+        with st.form(f"conditioning_form_{category}", clear_on_submit=True):
+            values = {}
+            for m in metrics:
+                cfg = CONDITIONING_METRICS[m]
+                values[m] = st.number_input(f"{m} ({cfg['unit']})", min_value=0.0,
+                                             value=float(targets[m]["next_target"]), step=1.0, key=f"val_{m}")
+            completed = st.segmented_control("Completed target?", ["Yes", "No"], default="Yes", key=f"c_completed_{category}")
+            rpe = st.pills("RPE", list(range(1, 11)), default=7, key=f"c_rpe_{category}")
+            notes = st.text_input("Notes (optional)", key=f"c_notes_{category}")
             submitted = st.form_submit_button("✅ Log it", use_container_width=True)
 
         if submitted:
-            prev_pr = logic.get_conditioning_pr(conn, item)
-            logic.log_conditioning(conn, date.today(), category, item, value=value,
-                                    rpe=rpe, completed=(completed == "Yes"), notes=notes)
-            is_pr = prev_pr is None or (value >= prev_pr if cfg["higher_is_better"] else value <= prev_pr)
-            next_up = logic.get_next_conditioning_target(conn, item, logic.get_last_conditioning_entry(conn, item))
-            if is_pr:
+            session_id = f"{category}-{logic.local_today().isoformat()}"
+            new_prs, next_lines = [], []
+            for m in metrics:
+                cfg = CONDITIONING_METRICS[m]
+                logic.log_conditioning(conn, logic.local_today(), category, m, value=values[m],
+                                        rpe=rpe, completed=(completed == "Yes"), notes=notes, session=session_id)
+                is_pr = prev_prs[m] is None or (values[m] >= prev_prs[m] if cfg["higher_is_better"] else values[m] <= prev_prs[m])
+                if is_pr:
+                    new_prs.append(m)
+                next_up = logic.get_next_conditioning_target(conn, m, logic.get_last_conditioning_entry(conn, m))
+                next_lines.append(f"**{m}**: {next_up['next_target']:g} {cfg['unit']} — {next_up['message']}")
+            if new_prs:
                 st.balloons()
-                st.success(f"🏆 New PR on {item}! Next time: **{next_up['next_target']:g} {cfg['unit']}** — {next_up['message']}")
+                st.success(f"🏆 New PR on {', '.join(new_prs)}!\n\nNext time:\n\n" + "\n\n".join(next_lines))
             else:
-                st.success(f"Logged. Next time: **{next_up['next_target']:g} {cfg['unit']}** — {next_up['message']}")
+                st.success("Logged.\n\nNext time:\n\n" + "\n\n".join(next_lines))
             reset_active_target()
 
     # --- Mobility logging form ----------------------------------------------
@@ -207,7 +220,7 @@ with tab_log:
             notes = st.text_input("Notes (optional)", key="mobility_notes")
             submitted = st.form_submit_button("✅ Log it", use_container_width=True)
         if submitted:
-            logic.log_conditioning(conn, date.today(), "Mobility", None, value=duration,
+            logic.log_conditioning(conn, logic.local_today(), "Mobility", None, value=duration,
                                     rpe=None, completed=True, notes=notes)
             st.success("Logged — nice work.")
             reset_active_target()
