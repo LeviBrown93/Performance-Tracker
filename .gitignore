@@ -1,0 +1,7 @@
+tracker.db
+*.db
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.venv/
+venv/

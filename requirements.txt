@@ -1,0 +1,3 @@
+streamlit>=1.50
+pandas
+psycopg2-binary
