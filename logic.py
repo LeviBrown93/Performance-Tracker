@@ -166,8 +166,32 @@ _POSTGRES_SCHEMA = """
 """
 
 
+def _existing_columns(conn, table: str) -> set:
+    if conn.dialect == "postgres":
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?", (table,)
+        ).fetchall()
+        return {r["column_name"] for r in rows}
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r["name"] for r in rows}
+
+
 def init_db(conn):
     conn.executescript(_POSTGRES_SCHEMA if conn.dialect == "postgres" else _SQLITE_SCHEMA)
+    conn.commit()
+
+    # Migration safety net: CREATE TABLE IF NOT EXISTS does nothing to a table
+    # that already existed before a schema change (e.g. adding the `session`
+    # column to conditioning_log). This patches any missing columns onto an
+    # existing table instead of silently leaving it stale.
+    required_columns = {
+        "conditioning_log": [("session", "TEXT")],
+    }
+    for table, columns in required_columns.items():
+        existing = _existing_columns(conn, table)
+        for col_name, col_type in columns:
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
     conn.commit()
 
 
